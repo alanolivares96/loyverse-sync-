@@ -2,8 +2,66 @@
 /**
  * Plugin Name: Loyverse Sync
  * Description: Sincroniza Loyverse con WooCommerce: productos, variantes, imágenes, inventario, eliminaciones y órdenes → recibos.
- * Version: 1.1.3
+ * Version: 1.2.2
  * Requires Plugins: woocommerce
+ *
+ * Novedades 1.2.2:
+ *  - Cursor de paginacion caducado (INVALID_CURSOR): si GET /inventory,
+ *    /items o /variants falla con un cursor guardado, el cursor muerto
+ *    se borra y la enumeracion se reintenta una sola vez desde el
+ *    inicio; si el reintento falla, no queda cursor guardado. Antes el
+ *    cursor muerto se reintentaba en cada corrida y el inventario (o
+ *    la enumeracion) dejaba de avanzar para siempre.
+ *  - Diagnostico: si un item llega sin variantes vivas, queda en el
+ *    log; la sincronizacion individual registra cuantas variantes
+ *    devolvio Loyverse y cuantas quedaron vivas.
+ *
+ * Novedades 1.2.1:
+ *  - Sincronizar un solo producto: el meta box "Loyverse Sync" ya
+ *    no usa un <form> anidado dentro de la pantalla de edicion del
+ *    producto (HTML invalido: el navegador lo ignoraba y el boton
+ *    terminaba enviando el formulario principal, yendo al listado
+ *    de entradas sin sincronizar nada). Ahora es un enlace con
+ *    nonce (wp_nonce_url) a admin-post.php?action=lvs_sync_one y
+ *    el handler lee product_id de $_REQUEST.
+ *
+ * Novedades 1.2.0:
+ *  - Webhooks de Loyverse: endpoint REST propio
+ *    /wp-json/loyverse-sync/v1/webhook que, con un secreto compartido
+ *    (lvs_webhook_secret, generado solo), sincroniza el item afectado
+ *    al recibir eventos de items o de inventario. Loyverse SI ofrece
+ *    webhooks (Back Office o POST /webhooks; eventos receipts, items,
+ *    inventory levels, customers y shifts), pero solo los creados por
+ *    OAuth llevan X-Loyverse-Signature (HMAC-SHA1); los creados con
+ *    token personal no llevan firma, por eso se verifica el secreto
+ *    propio (?secret= o cabecera X-Loyverse-Secret). El webhook solo
+ *    avisa: el plugin relee el item con GET /items/{id}. El cron de
+ *    10 minutos sigue como respaldo. Registro manual en Loyverse.
+ *  - Atributos globales (lvs_global_attrs, activada por defecto): las
+ *    opciones de Loyverse se crean como atributos globales pa_* con
+ *    sus terminos, asi sirven para filtros de tienda. Apagada, se
+ *    usan atributos personalizados como antes. Los productos
+ *    existentes migran solos en la siguiente sincronizacion.
+ *  - Sincronizacion por categorias (lvs_sync_categories, vacia =
+ *    todas): multi-select en el panel; los items fuera de la
+ *    seleccion no se crean ni se actualizan, y los productos que ya
+ *    existen en Woo y quedan fuera NO se borran, solo dejan de
+ *    sincronizarse.
+ *  - Reembolsos y cancelaciones: al reembolsar una orden en Woo se
+ *    crea un recibo REFUND en Loyverse con POST
+ *    /receipts/{receipt_number}/refund (lineas por id de linea del
+ *    recibo original). Limites de la API: solo recibos pagados con un
+ *    unico pago, y no para pagos integrados (iZettle, SumUp, etc.).
+ *    La API NO tiene endpoint para anular un recibo ya creado: una
+ *    orden cancelada en Woo no anula su recibo en Loyverse y debe
+ *    cancelarse a mano en el Back Office. No se duplican recibos.
+ *  - Precios por tienda y ofertas: si hay tienda configurada
+ *    (LVS_STORE_ID o campo en el panel), el precio de cada variante
+ *    se toma del stores[] de esa tienda; si no, del default_price.
+ *    Loyverse NO expone precio de oferta por variante/item (los
+ *    descuentos son un recurso aparte y se aplican en el recibo),
+ *    asi que no se inventa sale_price: el precio de oferta puesto a
+ *    mano en Woo no se sobrescribe.
  *
  * Novedades 1.1.3:
  *  - No pisar ediciones en Woo: opcion "No sobrescribir nombre y
@@ -117,6 +175,43 @@ function lvs_preserve_edits() {
 	return (bool) get_option( 'lvs_preserve_edits', 0 );
 }
 
+// Opciones nuevas 1.2.0.
+function lvs_global_attrs() {
+	return (bool) get_option( 'lvs_global_attrs', 1 ); // activada por defecto
+}
+
+function lvs_sync_categories() {
+	$c = get_option( 'lvs_sync_categories', [] );
+	if ( ! is_array( $c ) ) return [];
+	return array_values( array_filter( array_map( 'strval', $c ) ) );
+}
+
+// true si la categoría del item está dentro de la selección
+// (lista vacía = todas las categorías).
+function lvs_category_allowed( $category_id ) {
+	$sel = lvs_sync_categories();
+	if ( ! $sel ) return true;
+	return in_array( (string) $category_id, $sel, true );
+}
+
+// Secreto del webhook: se genera solo la primera vez que se necesita.
+function lvs_webhook_secret() {
+	$s = (string) get_option( 'lvs_webhook_secret', '' );
+	if ( $s === '' ) {
+		$s = wp_generate_password( 32, false );
+		update_option( 'lvs_webhook_secret', $s, false );
+	}
+	return $s;
+}
+
+// ID de tienda configurado (constante o opción), sin auto-asignar la
+// primera tienda: para precios por tienda solo vale un ID elegido
+// explícitamente (LVS_STORE_ID o el campo del panel).
+function lvs_configured_store_id() {
+	if ( defined( 'LVS_STORE_ID' ) ) return (string) LVS_STORE_ID;
+	return (string) get_option( 'lvs_store_id', '' );
+}
+
 // Ultimo error relevante: se guarda con mensaje y timestamp para
 // mostrarlo en el panel y como admin_notice. Un flag global marca si
 // la corrida actual registro algun error, para no limpiarlo al final
@@ -218,6 +313,7 @@ register_activation_hook( __FILE__, function () {
 	if ( ! wp_next_scheduled( 'lvs_sync_event' ) )   wp_schedule_event( time() + 60, 'lvs_10min', 'lvs_sync_event' );
 	if ( ! wp_next_scheduled( 'lvs_weekly_event' ) ) wp_schedule_event( time() + 3600, 'lvs_weekly', 'lvs_weekly_event' );
 	if ( ! get_option( 'lvs_activated_at' ) ) update_option( 'lvs_activated_at', time(), false ); // solo órdenes posteriores
+	if ( ! get_option( 'lvs_webhook_secret' ) ) update_option( 'lvs_webhook_secret', wp_generate_password( 32, false ), false );
 	lvs_reset_full();
 } );
 register_deactivation_hook( __FILE__, function () {
@@ -337,7 +433,23 @@ function lvs_sync_items() {
 		if ( $cursor ) $args['cursor'] = $cursor;
 
 		$data = lvs_get( '/items', $args );
-		if ( ! is_array( $data ) ) return; // error: conserva estado y reintenta luego
+		if ( ! is_array( $data ) ) {
+			// Cursor caducado (INVALID_CURSOR de Loyverse): el cursor
+			// guardado ya no existe. Borrarlo y reintentar una sola vez
+			// desde el inicio; la lista 'seen' ya recolectada se
+			// conserva (el upsert es idempotente, no hay duplicados).
+			if ( $cursor ) {
+				$st['cursor'] = '';
+				$cursor = '';
+				update_option( 'lvs_state', $st, false );
+				lvs_log( 'Cursor de productos inválido o caducado, reiniciando la enumeración desde el inicio', 'warning' );
+				unset( $args['cursor'] );
+				$data = lvs_get( '/items', $args );
+				if ( ! is_array( $data ) ) return;
+			} else {
+				return; // error: conserva estado y reintenta luego
+			}
+		}
 
 		foreach ( ( isset( $data['items'] ) ? $data['items'] : [] ) as $item ) {
 			$processed++;
@@ -345,6 +457,20 @@ function lvs_sync_items() {
 			try {
 				if ( ! empty( $item['deleted_at'] ) ) {
 					lvs_delete_item( $item['id'] );
+					continue;
+				}
+				if ( ! lvs_category_allowed( isset( $item['category_id'] ) ? $item['category_id'] : '' ) ) {
+					// Fuera de la selección de categorías (1.2.0): no se
+					// crea ni se actualiza, pero se marca como "visto" en
+					// la pasada completa para que la reconciliación NO lo
+					// borre de Woo (solo deja de sincronizarse).
+					lvs_log( 'Item ' . $item['id'] . ' saltado por filtro de categorías (categoría ' . ( isset( $item['category_id'] ) ? $item['category_id'] : 'sin categoría' ) . ').' );
+					if ( $full ) {
+						$seen[] = $item['id'];
+						foreach ( lvs_live_variants( isset( $item['variants'] ) ? $item['variants'] : [] ) as $sv ) {
+							if ( ! empty( $sv['variant_id'] ) ) $seen_var[] = $sv['variant_id'];
+						}
+					}
 					continue;
 				}
 				lvs_upsert_item( $item, $cats );
@@ -533,12 +659,26 @@ function lvs_delete_all_variations( $parent_id ) {
 }
 
 function lvs_price( $v ) {
+	// Precio por tienda (1.2.0): si hay una tienda configurada y la
+	// variante trae precio para esa tienda en stores[], ese precio
+	// manda sobre el default_price. Sin tienda configurada, el
+	// comportamiento anterior (default_price, o el primer store).
+	$sid = lvs_configured_store_id();
+	if ( $sid !== '' && isset( $v['stores'] ) && is_array( $v['stores'] ) ) {
+		foreach ( $v['stores'] as $s ) {
+			if ( ( isset( $s['store_id'] ) ? (string) $s['store_id'] : '' ) === $sid && isset( $s['price'] ) ) return $s['price'];
+		}
+	}
 	if ( isset( $v['default_price'] ) ) return $v['default_price'];
 	foreach ( ( isset( $v['stores'] ) ? $v['stores'] : [] ) as $s ) {
 		if ( isset( $s['price'] ) ) return $s['price'];
 	}
 	return null;
 }
+// Nota (1.2.0): Loyverse NO expone precio de oferta por variante ni por
+// item (los descuentos son un recurso aparte y se aplican en el recibo),
+// así que lvs_apply_variant() no toca el sale_price de Woo: un precio de
+// oferta puesto a mano en Woo no se sobrescribe ni se inventa.
 
 function lvs_apply_variant( $p, $v, $item ) {
 	$sku = trim( (string) ( isset( $v['sku'] ) ? $v['sku'] : '' ) );
@@ -554,13 +694,47 @@ function lvs_apply_variant( $p, $v, $item ) {
 	if ( ! $track ) $p->set_stock_status( 'instock' );
 }
 
-// Atributos (opciones) para productos variables
+// Atributos (opciones) para productos variables.
+// 1.2.0: con lvs_global_attrs() activo, cada opción de Loyverse se crea
+// como atributo global pa_* (wc_create_attribute si no existe) con sus
+// términos, y las variaciones usan ese atributo global; así sirven para
+// filtros de tienda. Apagado, se mantiene el comportamiento anterior
+// (atributos personalizados). La migración de productos existentes ocurre
+// sola en la siguiente sincronización, porque lvs_upsert_item() reescribe
+// los atributos del producto en cada pasada; los términos de atributos
+// personalizados viejos quedan en la BD sin usarse.
+function lvs_global_attribute( $name ) {
+	$slug = substr( sanitize_title( $name ), 0, 28 );
+	if ( $slug === '' ) return null;
+	$tax = 'pa_' . $slug;
+	if ( taxonomy_exists( $tax ) ) {
+		$aid = function_exists( 'wc_attribute_taxonomy_id_by_name' ) ? (int) wc_attribute_taxonomy_id_by_name( $tax ) : 0;
+		return [ 'id' => $aid, 'slug' => $slug, 'taxonomy' => $tax ];
+	}
+	if ( ! function_exists( 'wc_create_attribute' ) ) return null;
+	$aid = wc_create_attribute( [
+		'name'         => $name,
+		'slug'         => $slug,
+		'type'         => 'select',
+		'order_by'     => 'menu_order',
+		'has_archives' => false,
+	] );
+	if ( is_wp_error( $aid ) ) return null;
+	return [ 'id' => (int) $aid, 'slug' => $slug, 'taxonomy' => $tax ];
+}
+
 function lvs_attr_map( $item, $variants ) {
 	$names = [];
 	for ( $n = 1; $n <= 3; $n++ ) {
 		if ( ! empty( $item[ "option{$n}_name" ] ) ) $names[ $n ] = $item[ "option{$n}_name" ];
 	}
 	if ( ! $names ) $names[1] = 'Variante';
+
+	$global = lvs_global_attrs();
+	$ginfo = [];
+	if ( $global ) {
+		foreach ( $names as $n => $name ) $ginfo[ $n ] = lvs_global_attribute( $name );
+	}
 
 	$opts = [];
 	$map  = [];
@@ -570,14 +744,33 @@ function lvs_attr_map( $item, $variants ) {
 			if ( $val === '' ) {
 				$val = ! empty( $v['sku'] ) ? (string) $v['sku'] : 'Opción ' . ( $i + 1 );
 			}
-			$opts[ $name ][ $val ] = true;
-			$map[ $v['variant_id'] ][ sanitize_title( $name ) ] = $val;
+			if ( ! empty( $ginfo[ $n ] ) ) {
+				// Atributo global: la clave es la taxonomía pa_* y el valor
+				// es el slug del término (se crea si no existe).
+				$tax = $ginfo[ $n ]['taxonomy'];
+				$term_slug = sanitize_title( $val );
+				$term = term_exists( $val, $tax );
+				if ( is_array( $term ) && ! empty( $term['slug'] ) ) {
+					$term_slug = (string) $term['slug'];
+				} elseif ( ! $term ) {
+					wp_insert_term( $val, $tax );
+				}
+				$opts[ $tax ][ $term_slug ] = true;
+				$map[ $v['variant_id'] ][ $tax ] = $term_slug;
+			} else {
+				$opts[ $name ][ $val ] = true;
+				$map[ $v['variant_id'] ][ sanitize_title( $name ) ] = $val;
+			}
 		}
 	}
 	$attrs = [];
 	foreach ( $opts as $name => $vals ) {
 		$a = new WC_Product_Attribute();
-		$a->set_id( 0 );
+		if ( strpos( $name, 'pa_' ) === 0 && function_exists( 'wc_attribute_taxonomy_id_by_name' ) ) {
+			$a->set_id( (int) wc_attribute_taxonomy_id_by_name( $name ) );
+		} else {
+			$a->set_id( 0 );
+		}
 		$a->set_name( $name );
 		$a->set_options( array_map( 'strval', array_keys( $vals ) ) );
 		$a->set_position( count( $attrs ) );
@@ -629,7 +822,10 @@ function lvs_upsert_item( $item, $cats ) {
 	// decidir variable/simple, ni crear atributos/variaciones, ni adoptarse
 	// por variant_id/SKU. Si no queda ninguna viva, no se crea nada.
 	$variants = lvs_live_variants( isset( $item['variants'] ) ? $item['variants'] : [] );
-	if ( ! $variants ) return;
+	if ( ! $variants ) {
+		lvs_log( 'Item ' . ( isset( $item['id'] ) ? $item['id'] : '?' ) . ' (' . ( isset( $item['item_name'] ) ? $item['item_name'] : '' ) . '): sin variantes vivas en Loyverse, no se actualiza' );
+		return;
+	}
 	$item['variants'] = $variants;
 
 	$is_var  = count( $variants ) > 1;
@@ -763,12 +959,31 @@ function lvs_sync_variants_global( $force = false ) {
 		if ( $cursor ) $args['cursor'] = $cursor;
 		$data = lvs_get( '/variants', $args );
 		if ( ! is_array( $data ) || ! isset( $data['variants'] ) || ! is_array( $data['variants'] ) ) {
-			// Endpoint caído o respuesta inesperada: NO se borra nada y el
-			// estado queda guardado para reanudar en la siguiente corrida.
-			lvs_log( 'Barrido /variants interrumpido (sin respuesta válida); no se eliminó ninguna variación. Se reanuda en la próxima corrida.', 'warning' );
-			update_option( 'lvs_var_state', [ 'cursor' => $cursor, 'active' => true ], false );
-			update_option( 'lvs_var_seen', $seen, false );
-			return false;
+			// Cursor caducado (INVALID_CURSOR de Loyverse): la enumeración
+			// parcial NO es válida para reconciliar. Borrar el estado y
+			// la lista vista, y reintentar una sola vez desde el inicio.
+			if ( $cursor ) {
+				delete_option( 'lvs_var_state' );
+				delete_option( 'lvs_var_seen' );
+				$seen = [];
+				$cursor = '';
+				lvs_log( 'Cursor de variaciones inválido o caducado, reiniciando la enumeración desde el inicio', 'warning' );
+				unset( $args['cursor'] );
+				$data = lvs_get( '/variants', $args );
+				if ( ! is_array( $data ) || ! isset( $data['variants'] ) || ! is_array( $data['variants'] ) ) {
+					// Reintento fallido: no se borra nada y no queda
+					// estado guardado (la próxima corrida empieza
+					// desde el inicio).
+					return false;
+				}
+			} else {
+				// Endpoint caído o respuesta inesperada: NO se borra nada y el
+				// estado queda guardado para reanudar en la siguiente corrida.
+				lvs_log( 'Barrido /variants interrumpido (sin respuesta válida); no se eliminó ninguna variación. Se reanuda en la próxima corrida.', 'warning' );
+				update_option( 'lvs_var_state', [ 'cursor' => $cursor, 'active' => true ], false );
+				update_option( 'lvs_var_seen', $seen, false );
+				return false;
+			}
 		}
 		foreach ( $data['variants'] as $v ) {
 			if ( ! empty( $v['deleted_at'] ) ) continue; // borrada en Loyverse: no es "vista" viva
@@ -1058,7 +1273,25 @@ function lvs_sync_inventory() {
 		if ( $cursor ) $args['cursor'] = $cursor;
 
 		$inv = lvs_get( '/inventory', $args );
-		if ( ! is_array( $inv ) ) return;
+		if ( ! is_array( $inv ) ) {
+			// Cursor caducado (INVALID_CURSOR de Loyverse): el cursor
+			// guardado ya no existe. Borrarlo y reintentar una sola vez
+			// desde el inicio (mismo updated_at_min); si el reintento
+			// falla, salir sin dejar cursor guardado. Antes el cursor
+			// muerto se reintentaba en cada corrida y el inventario
+			// dejaba de sincronizarse para siempre.
+			if ( $cursor ) {
+				delete_option( 'lvs_inv_cursor' );
+				delete_option( 'lvs_inv_started' );
+				$cursor = '';
+				lvs_log( 'Cursor de inventario inválido o caducado, reiniciando la enumeración desde el inicio', 'warning' );
+				unset( $args['cursor'] );
+				$inv = lvs_get( '/inventory', $args );
+				if ( ! is_array( $inv ) ) return;
+			} else {
+				return;
+			}
+		}
 
 		foreach ( ( isset( $inv['inventory_levels'] ) ? $inv['inventory_levels'] : [] ) as $l ) {
 			$count++;
@@ -1090,6 +1323,9 @@ function lvs_sync_inventory() {
  * ======================================================= */
 add_action( 'woocommerce_order_status_processing', 'lvs_send_order' );
 add_action( 'woocommerce_order_status_completed', 'lvs_send_order' );
+add_action( 'woocommerce_order_refunded', 'lvs_refund_order', 10, 2 );
+add_action( 'woocommerce_order_status_refunded', 'lvs_refund_order' );
+add_action( 'woocommerce_order_status_cancelled', 'lvs_cancel_order' );
 
 function lvs_send_order( $order_id ) {
 	$order = wc_get_order( $order_id );
@@ -1168,6 +1404,285 @@ function lvs_retry_orders() {
 		'meta_query'   => [ [ 'key' => '_loyverse_receipt_id', 'compare' => 'NOT EXISTS' ] ],
 	] );
 	foreach ( $ids as $oid ) lvs_send_order( $oid );
+	// Reintentos de reembolsos que fallaron al crearse en Loyverse.
+	$rids = wc_get_orders( [
+		'status'     => [ 'processing', 'completed', 'refunded' ],
+		'limit'      => 5,
+		'return'     => 'ids',
+		'meta_query' => [ [ 'key' => '_lvs_refund_pending', 'value' => '1' ] ],
+	] );
+	foreach ( $rids as $oid ) lvs_refund_order( $oid );
+}
+
+// Reembolso en Loyverse (1.2.0): la API SÍ permite crear un recibo de
+// reembolso con POST /receipts/{receipt_number}/refund, con line_items
+// [{id, quantity}] referenciando los IDs de línea del recibo original.
+// El reembolso repone el stock en Loyverse. Límites de la API: solo
+// recibos pagados con un ÚNICO pago, y no para recibos pagados con
+// pagos integrados (iZettle, SumUp, etc.); en esos casos la API devuelve
+// error y hay que reembolsar desde la app de Loyverse. No se duplica:
+// una orden con _loyverse_refund_receipt_id ya no se vuelve a reembolsar.
+function lvs_refund_order( $order_id, $refund_id = 0 ) {
+	$order = wc_get_order( $order_id );
+	if ( ! $order ) return;
+	$receipt = (string) $order->get_meta( '_loyverse_receipt_id' );
+	if ( $receipt === '' || $receipt === 'N/A' ) {
+		$order->add_order_note( 'Loyverse: esta orden no tiene recibo en Loyverse, así que no se pudo crear un recibo de reembolso.' );
+		lvs_log( "Orden #$order_id: reembolso sin recibo de Loyverse (nada que reembolsar)." );
+		return;
+	}
+	if ( $order->get_meta( '_loyverse_refund_receipt_id' ) ) return; // ya reembolsada
+	$lock = 'lvs_r_' . $order_id;
+	if ( get_transient( $lock ) ) return;
+	set_transient( $lock, 1, 120 );
+	lvs_do_refund( $order, $refund_id );
+	delete_transient( $lock );
+}
+
+function lvs_do_refund( $order, $refund_id = 0 ) {
+	$order_id = $order->get_id();
+	$receipt  = (string) $order->get_meta( '_loyverse_receipt_id' );
+
+	// Cantidades reembolsadas por variant_id de Loyverse.
+	$qty_by_variant = [];
+	if ( $refund_id ) {
+		$refund = wc_get_order( $refund_id );
+		if ( $refund ) {
+			foreach ( $refund->get_items() as $it ) {
+				$p = $it->get_product();
+				$vid = $p ? $p->get_meta( '_loyverse_variant_id' ) : '';
+				if ( $vid ) $qty_by_variant[ $vid ] = ( isset( $qty_by_variant[ $vid ] ) ? $qty_by_variant[ $vid ] : 0 ) + (float) $it->get_quantity();
+			}
+		}
+	}
+	if ( ! $qty_by_variant ) {
+		// Reembolso total (sin objeto de reembolso): todas las líneas.
+		foreach ( $order->get_items() as $it ) {
+			$p = $it->get_product();
+			$vid = $p ? $p->get_meta( '_loyverse_variant_id' ) : '';
+			if ( $vid ) $qty_by_variant[ $vid ] = (float) $it->get_quantity();
+		}
+	}
+	if ( ! $qty_by_variant ) {
+		$order->add_order_note( 'Loyverse: reembolso sin líneas vinculadas a Loyverse; no se creó recibo de reembolso.' );
+		lvs_log( "Orden #$order_id: reembolso sin líneas vinculadas a Loyverse.", 'warning' );
+		return;
+	}
+
+	// Traer el recibo original para mapear variant_id -> id de línea.
+	$rec   = lvs_get( '/receipts/' . rawurlencode( $receipt ) );
+	$lines = isset( $rec['line_items'] ) ? $rec['line_items'] : [];
+	if ( ! $lines ) {
+		$order->update_meta_data( '_lvs_refund_pending', '1' );
+		$order->save();
+		lvs_log( "Orden #$order_id: no se pudo leer el recibo $receipt de Loyverse para reembolsarlo; queda pendiente.", 'warning' );
+		return;
+	}
+	$refund_lines = [];
+	foreach ( $lines as $li ) {
+		$vid = isset( $li['variant_id'] ) ? $li['variant_id'] : '';
+		if ( ! $vid || ! isset( $qty_by_variant[ $vid ] ) ) continue;
+		$qty = min( (float) $qty_by_variant[ $vid ], (float) ( isset( $li['quantity'] ) ? $li['quantity'] : 0 ) );
+		if ( $qty > 0 ) $refund_lines[] = [ 'id' => $li['id'], 'quantity' => $qty ];
+	}
+	if ( ! $refund_lines ) {
+		$order->add_order_note( 'Loyverse: ninguna línea reembolsada coincide con el recibo ' . $receipt . '; no se creó recibo de reembolso.' );
+		lvs_log( "Orden #$order_id: reembolso sin líneas coincidentes en el recibo $receipt.", 'warning' );
+		return;
+	}
+	if ( lvs_dry_run() ) {
+		lvs_log( "[Simulación] Orden #$order_id: se crearía un recibo de reembolso en Loyverse para el recibo $receipt con " . count( $refund_lines ) . " líneas (no se envió nada)" );
+		$order->add_order_note( 'Loyverse [Simulación]: se crearía un recibo de reembolso, no se envió nada.' );
+		$order->save();
+		return;
+	}
+	$r = lvs_request( 'POST', '/receipts/' . rawurlencode( $receipt ) . '/refund', [], [
+		'line_items' => $refund_lines,
+		'store_id'   => lvs_store_id(),
+		'source'     => 'Sitio web',
+	] );
+	if ( $r['ok'] ) {
+		$num = isset( $r['data']['receipt_number'] ) ? $r['data']['receipt_number'] : 'ok';
+		$order->update_meta_data( '_loyverse_refund_receipt_id', $num );
+		$order->delete_meta_data( '_lvs_refund_pending' );
+		$order->add_order_note( 'Loyverse: recibo de reembolso ' . $num . ' creado (reembolso del recibo ' . $receipt . ').' );
+		lvs_log( "Orden #$order_id: recibo de reembolso $num creado en Loyverse." );
+	} else {
+		// No se marca como reembolsada: queda pendiente y se reintenta
+		// en lvs_retry_orders(). Si la API rechazó el reembolso por sus
+		// límites (varios pagos, pago integrado), el error queda en el log.
+		$order->update_meta_data( '_lvs_refund_pending', '1' );
+		$order->add_order_note( 'Loyverse: error al crear el recibo de reembolso (se reintentará). Ver registros loyverse-sync.' );
+		lvs_set_last_error( 'Error al crear el recibo de reembolso de la orden #' . $order_id . ' en Loyverse.' );
+		lvs_log( "Orden #$order_id: error al crear recibo de reembolso en Loyverse.", 'error' );
+	}
+	$order->save();
+}
+
+// Cancelación en Woo (1.2.0): la API de Loyverse NO tiene endpoint para
+// cancelar/anular un recibo ya creado, así que una orden cancelada NO
+// anula su recibo en Loyverse: hay que cancelarlo a mano en el Back
+// Office (Recibos → recibo → Cancelar). Si la orden se cancela antes de
+// enviarse, se marca para que un reintento posterior no la envíe.
+function lvs_cancel_order( $order_id ) {
+	$order = wc_get_order( $order_id );
+	if ( ! $order ) return;
+	$receipt = (string) $order->get_meta( '_loyverse_receipt_id' );
+	if ( $receipt === '' || $receipt === 'N/A' ) {
+		$order->update_meta_data( '_loyverse_receipt_id', 'N/A' );
+		$order->add_order_note( 'Loyverse: orden cancelada antes de enviarse; no se creará recibo.' );
+		$order->save();
+		lvs_log( "Orden #$order_id cancelada antes de enviarse a Loyverse." );
+		return;
+	}
+	$order->add_order_note( 'Loyverse: la orden se canceló en Woo, pero el recibo ' . $receipt . ' NO se puede anular vía API. Cancélalo a mano en Loyverse (Back Office → Recibos).' );
+	lvs_log( "Orden #$order_id cancelada: recibo $receipt en Loyverse no anulable por API; requiere cancelación manual.", 'warning' );
+}
+
+/* =========================================================
+ * Webhooks de Loyverse (1.2.0)
+ * Loyverse SÍ ofrece webhooks: se crean en el Back Office
+ * (r.loyverse.com/dashboard/#/webhooks) o con POST /webhooks usando
+ * un token de acceso o OAuth 2.0. Eventos: receipts, items,
+ * inventory levels y customers actualizados, y shifts creados.
+ * Solo los webhooks creados por OAuth incluyen la cabecera
+ * X-Loyverse-Signature (HMAC-SHA1, hex); los creados con un token
+ * personal NO llevan firma. Por eso este endpoint verifica un
+ * secreto compartido propio (lvs_webhook_secret): se acepta como
+ * ?secret=... en la URL o cabecera X-Loyverse-Secret, y también se
+ * acepta X-Loyverse-Signature cuando coincide con
+ * HMAC-SHA1(cuerpo, secreto). El webhook solo avisa de que algo
+ * cambió: el plugin siempre vuelve a leer el item autoritativo con
+ * GET /items/{id} y nunca confía en los datos del payload. El cron
+ * de 10 minutos sigue como respaldo por si un webhook se pierde.
+ * ======================================================= */
+add_action( 'rest_api_init', function () {
+	register_rest_route( 'loyverse-sync/v1', '/webhook', [
+		'methods'             => 'POST',
+		'callback'            => 'lvs_webhook_handler',
+		'permission_callback' => '__return_true', // el secreto se verifica dentro
+	] );
+} );
+
+function lvs_webhook_handler( $request ) {
+	$raw  = (string) $request->get_body();
+	$data = json_decode( $raw, true );
+	if ( ! is_array( $data ) ) {
+		lvs_log( 'Webhook Loyverse: cuerpo JSON inválido.', 'warning' );
+		return new WP_Error( 'lvs_bad_json', 'Cuerpo JSON inválido.', [ 'status' => 400 ] );
+	}
+	$secret = lvs_webhook_secret();
+	$provided = (string) $request->get_param( 'secret' );
+	if ( $provided === '' ) $provided = (string) $request->get_header( 'X-Loyverse-Secret' );
+	$sig = (string) $request->get_header( 'X-Loyverse-Signature' );
+	$ok = false;
+	if ( $secret !== '' && $provided !== '' && hash_equals( $secret, $provided ) ) $ok = true;
+	if ( ! $ok && $secret !== '' && $sig !== '' && hash_equals( hash_hmac( 'sha1', $raw, $secret ), strtolower( trim( $sig ) ) ) ) $ok = true;
+	if ( ! $ok ) {
+		lvs_log( 'Webhook Loyverse: secreto inválido, entrega rechazada.', 'warning' );
+		return new WP_Error( 'lvs_bad_secret', 'Secreto inválido.', [ 'status' => 403 ] );
+	}
+	$event = '';
+	foreach ( [ 'event', 'type', 'event_type', 'name' ] as $k ) {
+		if ( ! empty( $data[ $k ] ) ) { $event = (string) $data[ $k ]; break; }
+	}
+	$payload = ( isset( $data['data'] ) && is_array( $data['data'] ) ) ? $data['data'] : $data;
+	$item_id = ! empty( $payload['item_id'] ) ? (string) $payload['item_id'] : ( ! empty( $payload['id'] ) ? (string) $payload['id'] : '' );
+	$variant_id = ! empty( $payload['variant_id'] ) ? (string) $payload['variant_id'] : '';
+	update_option( 'lvs_webhook_last', [ 'event' => $event, 'ts' => time() ], false );
+	$ev = strtolower( $event );
+	if ( strpos( $ev, 'item' ) !== false ) {
+		if ( $item_id === '' && $variant_id !== '' ) $item_id = lvs_item_id_for_variant( $variant_id );
+		if ( $item_id === '' ) {
+			lvs_log( 'Webhook Loyverse (' . $event . '): sin item_id, se ignora.' );
+			return [ 'received' => true, 'ignored' => true ];
+		}
+		lvs_webhook_sync_item( $item_id );
+		return [ 'received' => true, 'item_id' => $item_id ];
+	}
+	if ( strpos( $ev, 'inventor' ) !== false ) {
+		if ( $variant_id === '' && ! empty( $payload['variant_ids'] ) && is_array( $payload['variant_ids'] ) ) $variant_id = (string) $payload['variant_ids'][0];
+		if ( $variant_id !== '' ) {
+			$item_id = lvs_item_id_for_variant( $variant_id );
+			if ( $item_id !== '' ) {
+				lvs_webhook_sync_item( $item_id );
+				lvs_webhook_sync_stock( $variant_id );
+				return [ 'received' => true, 'variant_id' => $variant_id, 'item_id' => $item_id ];
+			}
+		}
+		lvs_log( 'Webhook Loyverse (' . $event . '): variante sin producto vinculado, se ignora.' );
+		return [ 'received' => true, 'ignored' => true ];
+	}
+	// receipts, customers, shifts, etc.: no afectan al catálogo.
+	lvs_log( 'Webhook Loyverse (' . ( $event !== '' ? $event : 'sin evento' ) . '): no afecta al catálogo, se ignora.' );
+	return [ 'received' => true, 'ignored' => true ];
+}
+
+// ID de Loyverse del producto al que pertenece una variante en Woo.
+function lvs_item_id_for_variant( $variant_id ) {
+	$pid = lvs_find_parent_by_variant_id( $variant_id );
+	if ( ! $pid ) return '';
+	return (string) get_post_meta( $pid, '_loyverse_id', true );
+}
+
+// Sincroniza un solo item por webhook (releyéndolo de la API).
+function lvs_webhook_sync_item( $item_id ) {
+	global $lvs_deadline;
+	$lvs_deadline = time() + 60;
+	$data = lvs_get( '/items/' . $item_id );
+	$item = null;
+	if ( is_array( $data ) ) {
+		if ( isset( $data['variants'] ) ) $item = $data;
+		elseif ( isset( $data['item']['variants'] ) ) $item = $data['item'];
+	}
+	if ( ! $item ) {
+		lvs_set_last_error( 'Webhook Loyverse: no se pudo traer el producto ' . $item_id . ' de Loyverse.' );
+		return;
+	}
+	// Respeta el filtro de categorías: fuera de la selección no se sincroniza.
+	if ( ! lvs_category_allowed( isset( $item['category_id'] ) ? $item['category_id'] : '' ) ) {
+		lvs_log( 'Webhook Loyverse: producto ' . $item_id . ' fuera de las categorías seleccionadas, se ignora.' );
+		return;
+	}
+	try {
+		if ( ! empty( $item['deleted_at'] ) ) {
+			lvs_delete_item( $item['id'] );
+		} else {
+			lvs_upsert_item( $item, lvs_categories() );
+		}
+		lvs_log( 'Webhook Loyverse: producto ' . $item_id . ' sincronizado.' );
+	} catch ( Throwable $e ) {
+		lvs_set_last_error( 'Webhook Loyverse, producto ' . $item_id . ': ' . $e->getMessage() );
+	}
+}
+
+// Actualiza el stock de una variante tras un webhook de inventario.
+// Si la API no devuelve niveles para esa variante, lo recoge el cron.
+function lvs_webhook_sync_stock( $variant_id ) {
+	global $wpdb;
+	$store = lvs_store_id();
+	if ( ! $store ) return;
+	$inv = lvs_get( '/inventory', [ 'store_id' => $store, 'variant_ids' => $variant_id, 'limit' => 10 ] );
+	$levels = isset( $inv['inventory_levels'] ) ? $inv['inventory_levels'] : [];
+	if ( ! $levels ) {
+		lvs_log( 'Webhook Loyverse: sin niveles de inventario para la variante ' . $variant_id . '; lo recogerá el cron.' );
+		return;
+	}
+	$pid = (int) $wpdb->get_var( $wpdb->prepare(
+		"SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_loyverse_variant_id' AND meta_value = %s LIMIT 1",
+		$variant_id
+	) );
+	if ( ! $pid ) return;
+	$p = wc_get_product( $pid );
+	if ( ! $p || ! $p->get_manage_stock() ) return;
+	foreach ( $levels as $l ) {
+		if ( ( isset( $l['variant_id'] ) ? (string) $l['variant_id'] : '' ) !== $variant_id ) continue;
+		$qty = (float) ( isset( $l['in_stock'] ) ? $l['in_stock'] : 0 );
+		if ( $p->get_stock_quantity() === null || (int) $p->get_stock_quantity() !== (int) $qty ) {
+			wc_update_product_stock( $p, $qty, 'set' );
+			lvs_log( 'Webhook Loyverse: stock de la variante ' . $variant_id . ' actualizado a ' . (int) $qty . '.' );
+		}
+	}
 }
 
 /* =========================================================
@@ -1251,7 +1766,30 @@ add_action( 'admin_post_lvs_save_settings', function () {
 	check_admin_referer( 'lvs_save_settings' );
 	update_option( 'lvs_preserve_edits', isset( $_POST['lvs_preserve_edits'] ) ? 1 : 0, false );
 	update_option( 'lvs_dry_run', isset( $_POST['lvs_dry_run'] ) ? 1 : 0, false );
+	update_option( 'lvs_global_attrs', isset( $_POST['lvs_global_attrs'] ) ? 1 : 0, false );
+	$cats = [];
+	if ( isset( $_POST['lvs_sync_categories'] ) && is_array( $_POST['lvs_sync_categories'] ) ) {
+		foreach ( $_POST['lvs_sync_categories'] as $c ) {
+			$c = sanitize_text_field( wp_unslash( $c ) );
+			if ( $c !== '' ) $cats[] = $c;
+		}
+	}
+	update_option( 'lvs_sync_categories', array_values( array_unique( $cats ) ), false );
+	if ( ! defined( 'LVS_STORE_ID' ) ) {
+		$sid = isset( $_POST['lvs_store_id'] ) ? sanitize_text_field( wp_unslash( $_POST['lvs_store_id'] ) ) : '';
+		update_option( 'lvs_store_id', $sid, false );
+	}
 	wp_safe_redirect( admin_url( 'admin.php?page=loyverse-sync&settings=1' ) );
+	exit;
+} );
+
+// Regenerar el secreto del webhook (1.2.0): hay que actualizar la URL
+// en Loyverse después, porque el secreto anterior deja de valer.
+add_action( 'admin_post_lvs_regen_webhook_secret', function () {
+	if ( ! current_user_can( 'manage_woocommerce' ) ) wp_die( 'No autorizado' );
+	check_admin_referer( 'lvs_regen_webhook_secret' );
+	update_option( 'lvs_webhook_secret', wp_generate_password( 32, false ), false );
+	wp_safe_redirect( admin_url( 'admin.php?page=loyverse-sync&webhook=1' ) );
 	exit;
 } );
 
@@ -1267,19 +1805,15 @@ function lvs_product_meta_box( $post ) {
 		return;
 	}
 	echo '<p>ID de Loyverse: <code>' . esc_html( $loy_id ) . '</code></p>';
-	echo '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '">';
-	echo '<input type="hidden" name="action" value="lvs_sync_one">';
-	echo '<input type="hidden" name="product_id" value="' . (int) $post->ID . '">';
-	wp_nonce_field( 'lvs_sync_one' );
-	echo '<button type="submit" class="button button-primary">Sincronizar este producto ahora</button>';
-	echo '</form>';
+	$url = wp_nonce_url( admin_url( 'admin-post.php?action=lvs_sync_one&product_id=' . (int) $post->ID ), 'lvs_sync_one' );
+	echo '<a href="' . esc_url( $url ) . '" class="button button-primary">Sincronizar este producto ahora</a>';
 	echo '<p class="description">Trae el producto fresco de Loyverse y actualiza solo este producto.</p>';
 }
 
 add_action( 'admin_post_lvs_sync_one', function () {
 	if ( ! current_user_can( 'manage_woocommerce' ) ) wp_die( 'No autorizado' );
 	check_admin_referer( 'lvs_sync_one' );
-	$pid = isset( $_POST['product_id'] ) ? (int) $_POST['product_id'] : 0;
+	$pid = isset( $_REQUEST['product_id'] ) ? (int) $_REQUEST['product_id'] : 0;
 	$edit = admin_url( 'post.php?post=' . $pid . '&action=edit' );
 	$loy_id = $pid ? get_post_meta( $pid, '_loyverse_id', true ) : '';
 	if ( ! $pid || ! $loy_id ) {
@@ -1297,6 +1831,11 @@ add_action( 'admin_post_lvs_sync_one', function () {
 		wp_safe_redirect( $edit . '&lvs_sync_error=1' );
 		exit;
 	}
+	// Diagnóstico (caso "Vestido sequin bow"): cuántas variantes trajo
+	// Loyverse y cuántas quedaron vivas tras filtrar deleted_at.
+	$all_vars  = isset( $item['variants'] ) && is_array( $item['variants'] ) ? $item['variants'] : [];
+	$live_vars = lvs_live_variants( $all_vars );
+	lvs_log( 'Sincronización individual #' . $pid . ': Loyverse devolvió ' . count( $all_vars ) . ' variantes, ' . count( $live_vars ) . ' vivas' );
 	try {
 		if ( ! empty( $item['deleted_at'] ) ) {
 			lvs_delete_item( $item['id'] );
@@ -1393,13 +1932,14 @@ function lvs_admin_page() {
 				<p>Sincroniza Loyverse con WooCommerce: productos, variantes, im&aacute;genes, inventario, eliminaciones y &oacute;rdenes &rarr; recibos.</p>
 			</div>
 			<div class="lvs-hero-side">
-				<span class="lvs-badge">Versi&oacute;n 1.1.3</span>
+				<span class="lvs-badge">Versi&oacute;n 1.2.2</span>
 				<?php if ( lvs_token() ) : ?><span class="lvs-pill lvs-pill-ok">Token configurado</span><?php else : ?><span class="lvs-pill lvs-pill-bad">Falta el token</span><?php endif; ?>
 			</div>
 		</header>
 		<?php if ( isset( $_GET['done'] ) ) echo '<div class="notice notice-success"><p>Listo. Revisa WooCommerce → Estado → Registros → loyverse-sync.</p></div>'; ?>
 		<?php if ( isset( $_GET['saved'] ) ) echo '<div class="notice notice-success"><p>Token guardado.</p></div>'; ?>
 		<?php if ( isset( $_GET['settings'] ) ) echo '<div class="notice notice-success"><p>Ajustes guardados.</p></div>'; ?>
+		<?php if ( isset( $_GET['webhook'] ) ) echo '<div class="notice notice-success"><p>Secreto del webhook regenerado. Actualiza la URL en Loyverse (Back Office → Webhooks), porque el secreto anterior ya no vale.</p></div>'; ?>
 		<?php if ( lvs_dry_run() ) : ?><div class="lvs-dry"><strong>Modo simulación activo:</strong> la reconciliación y las eliminaciones no borrarán ni mandarán nada a la papelera; solo se registrará en el log lo que se borraría. Desactívalo en Ajustes de sincronización cuando quieras aplicar los cambios de verdad.</div><?php endif; ?>
 		<?php $lvs_err = lvs_get_last_error(); if ( $lvs_err ) : ?><div class="lvs-error"><strong>Último error de Loyverse Sync</strong> (<?php echo esc_html( date_i18n( 'Y-m-d H:i:s', $lvs_err['ts'] ) ); ?>):<br><?php echo esc_html( $lvs_err['msg'] ); ?><br><span style="color:#646970">Revisa WooCommerce → Estado → Registros → loyverse-sync para el detalle. El aviso se limpia solo cuando una sincronización completa termine sin errores.</span></div><?php endif; ?>
 		<section class="lvs-cards">
@@ -1423,7 +1963,11 @@ function lvs_admin_page() {
 					<div class="lvs-row"><dt>Órdenes pendientes de enviar</dt><dd><?php echo (int) $pending; ?></dd></div>
 					<div class="lvs-row"><dt>Modo simulación</dt><dd><?php echo lvs_dry_run() ? '<b style="color:#b32d2e">Activo (no se borra nada)</b>' : 'No'; ?></dd></div>
 					<div class="lvs-row"><dt>No sobrescribir nombre/descripción</dt><dd><?php echo lvs_preserve_edits() ? 'Sí (productos existentes conservan sus ediciones)' : 'No'; ?></dd></div>
-					<div class="lvs-row"><dt>Versión del plugin</dt><dd>1.1.3</dd></div>
+					<div class="lvs-row"><dt>Atributos globales (pa_*)</dt><dd><?php echo lvs_global_attrs() ? 'Sí' : 'No (personalizados)'; ?></dd></div>
+					<div class="lvs-row"><dt>Categorías sincronizadas</dt><dd><?php $sc = lvs_sync_categories(); echo $sc ? count( $sc ) . ' seleccionadas' : 'Todas'; ?></dd></div>
+					<div class="lvs-row"><dt>Precio por tienda</dt><dd><?php $csid = lvs_configured_store_id(); echo $csid ? 'Tienda ' . esc_html( $csid ) : 'Sin tienda (precio por defecto)'; ?></dd></div>
+					<div class="lvs-row"><dt>Último webhook recibido</dt><dd><?php $wh = get_option( 'lvs_webhook_last', null ); echo ( is_array( $wh ) && ! empty( $wh['ts'] ) ) ? esc_html( date_i18n( 'Y-m-d H:i:s', (int) $wh['ts'] ) . ( ! empty( $wh['event'] ) ? ' (' . $wh['event'] . ')' : '' ) ) : '—'; ?></dd></div>
+					<div class="lvs-row"><dt>Versión del plugin</dt><dd>1.2.2</dd></div>
 					<div class="lvs-row"><dt>Reconciliación de productos pendiente</dt><dd><?php echo get_option( 'lvs_reconcile_pending', null ) ? '<b style="color:#b32d2e">SÍ (se reintenta en la próxima sincronización)</b>' : 'No'; ?></dd></div>
 					<div class="lvs-row"><dt>Última reconciliación de variaciones (/variants)</dt><dd><?php $vl = (int) get_option( 'lvs_var_last', 0 ); echo $vl ? esc_html( date_i18n( 'Y-m-d H:i:s', $vl ) ) : '—'; ?></dd></div>
 					<div class="lvs-row"><dt>Barrido de variaciones en curso</dt><dd><?php $vs2 = get_option( 'lvs_var_state', [] ); echo ! empty( $vs2['active'] ) ? 'Sí (se reanuda automáticamente)' : 'No'; ?></dd></div>
@@ -1445,7 +1989,7 @@ function lvs_admin_page() {
 				</section>
 				<section class="lvs-panel">
 					<h2>Ajustes de sincronización</h2>
-					<p class="lvs-sub">Opciones de la versión 1.1.3. Ambas están desactivadas por defecto.</p>
+					<p class="lvs-sub">Opciones de sincronización. Las de la 1.1.3 están desactivadas por defecto; los atributos globales están activados por defecto.</p>
 					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="lvs-checks">
 						<input type="hidden" name="action" value="lvs_save_settings">
 						<?php wp_nonce_field( 'lvs_save_settings' ); ?>
@@ -1453,8 +1997,35 @@ function lvs_admin_page() {
 							<span class="description">Con esta opción activa, un producto que ya existe conserva su nombre y descripción editados en Woo; solo se actualizan precio, stock, imagen, categoría y variaciones. Los productos nuevos sí toman los datos de Loyverse.</span></label>
 						<label><input type="checkbox" name="lvs_dry_run" value="1" <?php checked( lvs_dry_run() ); ?>> Modo simulación (no borrar nada)
 							<span class="description">La reconciliación de productos y de variaciones no borrará ni mandará nada a la papelera; solo registrará en el log lo que se borraría, como “[Simulación] …”. Úsalo para revisar antes de aplicar una limpieza.</span></label>
+						<label><input type="checkbox" name="lvs_global_attrs" value="1" <?php checked( lvs_global_attrs() ); ?>> Atributos globales de WooCommerce (pa_*)
+							<span class="description">Las opciones de Loyverse (talla, color…) se crean como atributos globales pa_* con sus términos, así sirven para filtros de tienda. Los productos existentes migran solos en la siguiente sincronización. Apagado, se usan atributos personalizados como antes.</span></label>
+						<label>Tienda para precios por tienda (ID de Loyverse)
+							<input type="text" name="lvs_store_id" value="<?php echo esc_attr( lvs_configured_store_id() ); ?>" class="regular-text" style="width:100%" <?php echo defined( 'LVS_STORE_ID' ) ? 'disabled' : ''; ?>>
+							<span class="description">Si se rellena, el precio de cada variante se toma del precio de esa tienda en Loyverse; si no, se usa el precio por defecto. <?php echo defined( 'LVS_STORE_ID' ) ? 'Definido por la constante LVS_STORE_ID en wp-config.php, que tiene prioridad.' : 'Vacío = sin tienda configurada (precio por defecto).'; ?> Loyverse no expone precio de oferta: el precio de oferta que pongas en Woo no se sobrescribe.</span></label>
+						<label>Categorías de Loyverse a sincronizar
+							<select name="lvs_sync_categories[]" multiple size="6" style="width:100%;min-height:120px">
+								<?php $lvs_cats = lvs_categories(); $lvs_sel = lvs_sync_categories(); foreach ( $lvs_cats as $lvs_cid => $lvs_cname ) : ?>
+								<option value="<?php echo esc_attr( $lvs_cid ); ?>" <?php selected( in_array( (string) $lvs_cid, $lvs_sel, true ) ); ?>><?php echo esc_html( $lvs_cname ); ?></option>
+								<?php endforeach; ?>
+							</select>
+							<span class="description">Sin selección se sincronizan todas. Los productos que ya existen en Woo y queden fuera de la selección NO se borran: solo dejan de sincronizarse.</span></label>
 						<button class="button button-primary">Guardar ajustes</button>
 					</form>
+				</section>
+				<section class="lvs-panel">
+					<h2>Webhooks de Loyverse</h2>
+					<p class="lvs-sub">Sincronización casi instantánea cuando cambia un producto o el inventario. El cron de 10 minutos sigue como respaldo.</p>
+					<dl class="lvs-rows">
+						<div class="lvs-row"><dt>Endpoint</dt><dd style="word-break:break-all"><?php echo esc_html( get_rest_url( null, 'loyverse-sync/v1/webhook' ) ); ?></dd></div>
+						<div class="lvs-row"><dt>Último webhook</dt><dd><?php $wh2 = get_option( 'lvs_webhook_last', null ); echo ( is_array( $wh2 ) && ! empty( $wh2['ts'] ) ) ? esc_html( date_i18n( 'Y-m-d H:i:s', (int) $wh2['ts'] ) . ( ! empty( $wh2['event'] ) ? ' (' . $wh2['event'] . ')' : '' ) ) : '—'; ?></dd></div>
+					</dl>
+					<p><label>Secreto del webhook (haz clic para seleccionarlo y copiarlo)<br><input type="text" readonly value="<?php echo esc_attr( lvs_webhook_secret() ); ?>" class="regular-text" style="width:100%" onclick="this.select()"></label></p>
+					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+						<input type="hidden" name="action" value="lvs_regen_webhook_secret">
+						<?php wp_nonce_field( 'lvs_regen_webhook_secret' ); ?>
+						<button class="button">Regenerar secreto</button>
+					</form>
+					<p class="description" style="margin-top:10px">Regístralo en Loyverse: Back Office → Webhooks (r.loyverse.com/dashboard/#/webhooks), eventos de items y de niveles de inventario, con la URL del endpoint y el secreto como parámetro: <code>?secret=TU_SECRETO</code>. Solo los webhooks creados por OAuth llevan la cabecera X-Loyverse-Signature; los creados con un token personal no llevan firma, por eso se verifica este secreto. Si regeneras el secreto, actualiza la URL en Loyverse.</p>
 				</section>
 				<section class="lvs-panel">
 					<h2>Token de Loyverse</h2>
