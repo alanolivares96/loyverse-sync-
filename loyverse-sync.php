@@ -2,8 +2,19 @@
 /**
  * Plugin Name: Loyverse Sync
  * Description: Sincroniza Loyverse con WooCommerce: productos, variantes, imágenes, inventario, eliminaciones y órdenes → recibos.
- * Version: 1.2.2
+ * Version: 1.3.0
  * Requires Plugins: woocommerce
+ *
+ * Novedades 1.3.0:
+ *  - Mantener variable con 1 variacion (lvs_keep_variable, activada
+ *    por defecto): un producto cuyas variaciones en Loyverse tengan
+ *    opciones (por ejemplo, TALLA) se queda como producto variable
+ *    aunque solo le quede 1 variacion viva, para que los clientes
+ *    vean que talla hay disponible. Sin opciones en Loyverse, el
+ *    producto sigue siendo simple; apagada la opcion, 1 variacion
+ *    vuelve a ser simple como antes. Aplica tambien en la
+ *    reconciliacion global: un variable al que solo le queda 1
+ *    variacion ya no se convierte a simple si tiene opciones.
  *
  * Novedades 1.2.2:
  *  - Cursor de paginacion caducado (INVALID_CURSOR): si GET /inventory,
@@ -173,6 +184,40 @@ function lvs_dry_run() {
 
 function lvs_preserve_edits() {
 	return (bool) get_option( 'lvs_preserve_edits', 0 );
+}
+
+// Opción nueva 1.3.0 (activada por defecto): mantener variable aunque
+// solo quede 1 variación, cuando el item tiene opciones en Loyverse
+// (tallas, colores...). Sin opciones, el producto sigue siendo simple.
+function lvs_keep_variable() {
+	return (bool) get_option( 'lvs_keep_variable', 1 );
+}
+
+// true si el item de Loyverse define al menos un nombre de opción
+// (option1_name / option2_name / option3_name no vacío).
+function lvs_item_has_options( $item ) {
+	if ( ! is_array( $item ) ) return false;
+	for ( $n = 1; $n <= 3; $n++ ) {
+		if ( ! empty( $item[ "option{$n}_name" ] ) && trim( (string) $item[ "option{$n}_name" ] ) !== '' ) return true;
+	}
+	return false;
+}
+
+// true si el producto padre ya tiene atributos de variación en Woo
+// (o alguna variación hija con atributos): respaldo local cuando no
+// se puede traer el item fresco de Loyverse para decidir si un
+// variable con 1 variación debe quedarse variable.
+function lvs_parent_has_variation_attrs( $parent_id ) {
+	$parent = wc_get_product( $parent_id );
+	if ( ! $parent || ! $parent->is_type( 'variable' ) ) return false;
+	foreach ( $parent->get_attributes() as $a ) {
+		if ( is_object( $a ) && method_exists( $a, 'get_variation' ) && $a->get_variation() ) return true;
+	}
+	foreach ( lvs_variation_post_ids( $parent_id ) as $cid ) {
+		$child = wc_get_product( $cid );
+		if ( $child && $child->get_attributes() ) return true;
+	}
+	return false;
 }
 
 // Opciones nuevas 1.2.0.
@@ -828,7 +873,10 @@ function lvs_upsert_item( $item, $cats ) {
 	}
 	$item['variants'] = $variants;
 
-	$is_var  = count( $variants ) > 1;
+	// 1.3.0: con "Mantener variable" activo y opciones en Loyverse
+	// (p. ej. TALLA), 1 sola variación viva sigue siendo variable para
+	// que la talla disponible se vea en la ficha. Sin opciones, simple.
+	$is_var  = count( $variants ) > 1 || ( lvs_keep_variable() && lvs_item_has_options( $item ) );
 	$type    = $is_var ? 'variable' : 'simple';
 	$id      = lvs_find_product( $item );
 	$is_new  = ! $id;
@@ -1047,8 +1095,10 @@ function lvs_reconcile_variations_global( $seen_variant_ids ) {
 		lvs_log( "Reconciliación de variaciones: variación #$cid ya no existe en Loyverse → eliminada" );
 		wp_delete_post( $cid, true );
 	}
-	// Padres afectados: si les queda 1 sola variación, hay que convertirlos
-	// a simple con los datos correctos; si les quedan 2+, solo resincronizar.
+	// Padres afectados: si les queda 1 sola variación, se revisa con el
+	// item fresco de Loyverse; con "Mantener variable" activo y opciones,
+	// se queda variable con su única variación (1.3.0). Si les quedan
+	// 2+, solo resincronizar.
 	foreach ( array_keys( $parents ) as $parent_id ) {
 		$parent = wc_get_product( $parent_id );
 		if ( ! $parent ) continue;
@@ -1065,9 +1115,10 @@ function lvs_reconcile_variations_global( $seen_variant_ids ) {
 	return true;
 }
 
-// Un variable al que solo le queda 1 variación debe pasar a simple.
-// Primero intenta traer el item fresco de Loyverse (datos autoritativos);
-// si eso falla, promueve la variación restante con los datos ya en Woo.
+// Un variable al que solo le queda 1 variación: se trae el item fresco
+// de Loyverse (datos autoritativos) y se decide con lvs_upsert_item();
+// con "Mantener variable" activo y opciones, se queda variable (1.3.0).
+// Si eso falla, se promueve la variación restante con los datos ya en Woo.
 function lvs_refresh_single_variant_parent( $parent_id ) {
 	$loy_id = get_post_meta( $parent_id, '_loyverse_id', true );
 	if ( $loy_id ) {
@@ -1100,6 +1151,14 @@ function lvs_promote_single_variation( $parent_id ) {
 	$child = wc_get_product( $children[0] );
 	$parent = wc_get_product( $parent_id );
 	if ( ! $child || ! $parent ) return;
+	// 1.3.0: con "Mantener variable" activo y atributos de variación en
+	// el padre (o en la variación restante), no convertir a simple: la
+	// talla debe seguir visible aunque solo quede 1 variación.
+	if ( lvs_keep_variable() && lvs_parent_has_variation_attrs( $parent_id ) ) {
+		WC_Product_Variable::sync( $parent_id );
+		lvs_log( "Variable con 1 variación (mantener variable activo): #$parent_id se queda variable con su única variación." );
+		return;
+	}
 	$saved = [
 		'sku'     => $child->get_sku(),
 		'regular' => $child->get_regular_price(),
@@ -1767,6 +1826,7 @@ add_action( 'admin_post_lvs_save_settings', function () {
 	update_option( 'lvs_preserve_edits', isset( $_POST['lvs_preserve_edits'] ) ? 1 : 0, false );
 	update_option( 'lvs_dry_run', isset( $_POST['lvs_dry_run'] ) ? 1 : 0, false );
 	update_option( 'lvs_global_attrs', isset( $_POST['lvs_global_attrs'] ) ? 1 : 0, false );
+	update_option( 'lvs_keep_variable', isset( $_POST['lvs_keep_variable'] ) ? 1 : 0, false );
 	$cats = [];
 	if ( isset( $_POST['lvs_sync_categories'] ) && is_array( $_POST['lvs_sync_categories'] ) ) {
 		foreach ( $_POST['lvs_sync_categories'] as $c ) {
@@ -1932,7 +1992,7 @@ function lvs_admin_page() {
 				<p>Sincroniza Loyverse con WooCommerce: productos, variantes, im&aacute;genes, inventario, eliminaciones y &oacute;rdenes &rarr; recibos.</p>
 			</div>
 			<div class="lvs-hero-side">
-				<span class="lvs-badge">Versi&oacute;n 1.2.2</span>
+				<span class="lvs-badge">Versi&oacute;n 1.3.0</span>
 				<?php if ( lvs_token() ) : ?><span class="lvs-pill lvs-pill-ok">Token configurado</span><?php else : ?><span class="lvs-pill lvs-pill-bad">Falta el token</span><?php endif; ?>
 			</div>
 		</header>
@@ -1964,10 +2024,11 @@ function lvs_admin_page() {
 					<div class="lvs-row"><dt>Modo simulación</dt><dd><?php echo lvs_dry_run() ? '<b style="color:#b32d2e">Activo (no se borra nada)</b>' : 'No'; ?></dd></div>
 					<div class="lvs-row"><dt>No sobrescribir nombre/descripción</dt><dd><?php echo lvs_preserve_edits() ? 'Sí (productos existentes conservan sus ediciones)' : 'No'; ?></dd></div>
 					<div class="lvs-row"><dt>Atributos globales (pa_*)</dt><dd><?php echo lvs_global_attrs() ? 'Sí' : 'No (personalizados)'; ?></dd></div>
+					<div class="lvs-row"><dt>Mantener variable con 1 variación</dt><dd><?php echo lvs_keep_variable() ? 'Sí (productos con opciones se quedan variables)' : 'No'; ?></dd></div>
 					<div class="lvs-row"><dt>Categorías sincronizadas</dt><dd><?php $sc = lvs_sync_categories(); echo $sc ? count( $sc ) . ' seleccionadas' : 'Todas'; ?></dd></div>
 					<div class="lvs-row"><dt>Precio por tienda</dt><dd><?php $csid = lvs_configured_store_id(); echo $csid ? 'Tienda ' . esc_html( $csid ) : 'Sin tienda (precio por defecto)'; ?></dd></div>
 					<div class="lvs-row"><dt>Último webhook recibido</dt><dd><?php $wh = get_option( 'lvs_webhook_last', null ); echo ( is_array( $wh ) && ! empty( $wh['ts'] ) ) ? esc_html( date_i18n( 'Y-m-d H:i:s', (int) $wh['ts'] ) . ( ! empty( $wh['event'] ) ? ' (' . $wh['event'] . ')' : '' ) ) : '—'; ?></dd></div>
-					<div class="lvs-row"><dt>Versión del plugin</dt><dd>1.2.2</dd></div>
+					<div class="lvs-row"><dt>Versión del plugin</dt><dd>1.3.0</dd></div>
 					<div class="lvs-row"><dt>Reconciliación de productos pendiente</dt><dd><?php echo get_option( 'lvs_reconcile_pending', null ) ? '<b style="color:#b32d2e">SÍ (se reintenta en la próxima sincronización)</b>' : 'No'; ?></dd></div>
 					<div class="lvs-row"><dt>Última reconciliación de variaciones (/variants)</dt><dd><?php $vl = (int) get_option( 'lvs_var_last', 0 ); echo $vl ? esc_html( date_i18n( 'Y-m-d H:i:s', $vl ) ) : '—'; ?></dd></div>
 					<div class="lvs-row"><dt>Barrido de variaciones en curso</dt><dd><?php $vs2 = get_option( 'lvs_var_state', [] ); echo ! empty( $vs2['active'] ) ? 'Sí (se reanuda automáticamente)' : 'No'; ?></dd></div>
@@ -1989,7 +2050,7 @@ function lvs_admin_page() {
 				</section>
 				<section class="lvs-panel">
 					<h2>Ajustes de sincronización</h2>
-					<p class="lvs-sub">Opciones de sincronización. Las de la 1.1.3 están desactivadas por defecto; los atributos globales están activados por defecto.</p>
+					<p class="lvs-sub">Opciones de sincronización. Las de la 1.1.3 están desactivadas por defecto; los atributos globales y mantener variable están activados por defecto.</p>
 					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="lvs-checks">
 						<input type="hidden" name="action" value="lvs_save_settings">
 						<?php wp_nonce_field( 'lvs_save_settings' ); ?>
@@ -1999,6 +2060,8 @@ function lvs_admin_page() {
 							<span class="description">La reconciliación de productos y de variaciones no borrará ni mandará nada a la papelera; solo registrará en el log lo que se borraría, como “[Simulación] …”. Úsalo para revisar antes de aplicar una limpieza.</span></label>
 						<label><input type="checkbox" name="lvs_global_attrs" value="1" <?php checked( lvs_global_attrs() ); ?>> Atributos globales de WooCommerce (pa_*)
 							<span class="description">Las opciones de Loyverse (talla, color…) se crean como atributos globales pa_* con sus términos, así sirven para filtros de tienda. Los productos existentes migran solos en la siguiente sincronización. Apagado, se usan atributos personalizados como antes.</span></label>
+						<label><input type="checkbox" name="lvs_keep_variable" value="1" <?php checked( lvs_keep_variable() ); ?>> Mantener productos variables aunque solo quede una variación
+							<span class="description">Con esta opción activa (por defecto), un producto cuyas variaciones en Loyverse tengan opciones (por ejemplo, TALLA) se queda como variable aunque solo le quede una variación viva, para que los clientes vean qué talla hay disponible. Sin opciones en Loyverse, el producto sigue siendo simple. Apagada, un producto con 1 variación vuelve a ser simple como antes.</span></label>
 						<label>Tienda para precios por tienda (ID de Loyverse)
 							<input type="text" name="lvs_store_id" value="<?php echo esc_attr( lvs_configured_store_id() ); ?>" class="regular-text" style="width:100%" <?php echo defined( 'LVS_STORE_ID' ) ? 'disabled' : ''; ?>>
 							<span class="description">Si se rellena, el precio de cada variante se toma del precio de esa tienda en Loyverse; si no, se usa el precio por defecto. <?php echo defined( 'LVS_STORE_ID' ) ? 'Definido por la constante LVS_STORE_ID en wp-config.php, que tiene prioridad.' : 'Vacío = sin tienda configurada (precio por defecto).'; ?> Loyverse no expone precio de oferta: el precio de oferta que pongas en Woo no se sobrescribe.</span></label>
