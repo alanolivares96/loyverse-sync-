@@ -2,8 +2,14 @@
 /**
  * Plugin Name: Loyverse Sync
  * Description: Sincroniza Loyverse con WooCommerce: productos, variantes, imágenes, inventario, eliminaciones y órdenes → recibos.
- * Version: 1.1.1
+ * Version: 1.1.2
  * Requires Plugins: woocommerce
+ *
+ * Novedades 1.1.2:
+ *  - Variantes borradas en Loyverse ya no resucitan en Woo: se ignoran
+ *    las variantes con deleted_at en /items, en /variants y al buscar
+ *    el producto por variant_id/SKU. El barrido global las trata como
+ *    huerfanas y las elimina de Woo. Sin cambios en el panel.
  *
  * Novedades 1.1.1:
  *  - Solo rediseño estético del panel admin (WooCommerce → Loyverse Sync):
@@ -61,6 +67,23 @@ function lvs_log( $msg, $level = 'info' ) {
 
 function lvs_iso( $ts = null ) {
 	return gmdate( 'Y-m-d\TH:i:s.000\Z', $ts ? $ts : time() );
+}
+
+// Variantes vivas de Loyverse: /items se pide con show_deleted=true para
+// detectar productos eliminados, pero esa respuesta tambien devuelve las
+// variantes borradas del item (con deleted_at). Sin este filtro, cada sync
+// recreaba en Woo las tallas ya borradas en Loyverse (caso "Vestido sequin
+// bow": 2 variantes vivas + tallas borradas que reaparecian). Solo se mira
+// deleted_at, ningun otro campo inventado.
+function lvs_live_variants( $variants ) {
+	if ( ! is_array( $variants ) ) return [];
+	$out = [];
+	foreach ( $variants as $v ) {
+		if ( ! is_array( $v ) ) continue;
+		if ( ! empty( $v['deleted_at'] ) ) continue;
+		$out[] = $v;
+	}
+	return $out;
 }
 
 function lvs_request( $method, $path, $args = [], $body = null ) {
@@ -266,7 +289,7 @@ function lvs_sync_items() {
 				lvs_upsert_item( $item, $cats );
 				if ( $full ) {
 					$seen[] = $item['id'];
-					foreach ( ( isset( $item['variants'] ) ? $item['variants'] : [] ) as $sv ) {
+					foreach ( lvs_live_variants( isset( $item['variants'] ) ? $item['variants'] : [] ) as $sv ) {
 						if ( ! empty( $sv['variant_id'] ) ) $seen_var[] = $sv['variant_id'];
 					}
 				}
@@ -338,13 +361,13 @@ function lvs_find_product( $item ) {
 	// sin _loyverse_id) y Loyverse ya solo conserva UNA de sus variaciones.
 	// Sin esto se creaba un producto simple nuevo y el variable viejo,
 	// con todas sus variaciones, quedaba intacto.
-	foreach ( ( isset( $item['variants'] ) ? $item['variants'] : [] ) as $v ) {
+	foreach ( lvs_live_variants( isset( $item['variants'] ) ? $item['variants'] : [] ) as $v ) {
 		if ( empty( $v['variant_id'] ) ) continue;
 		$pid = lvs_find_parent_by_variant_id( $v['variant_id'] );
 		if ( $pid ) return $pid;
 	}
 	// Adopta productos existentes (ej. creados por SKUPlugs) por SKU
-	foreach ( $item['variants'] as $v ) {
+	foreach ( lvs_live_variants( isset( $item['variants'] ) ? $item['variants'] : [] ) as $v ) {
 		if ( empty( $v['sku'] ) ) continue;
 		$pid = wc_get_product_id_by_sku( $v['sku'] );
 		if ( ! $pid ) continue;
@@ -521,8 +544,12 @@ function lvs_convert_product_type( $id, $type, $item, $variants ) {
 }
 
 function lvs_upsert_item( $item, $cats ) {
-	$variants = isset( $item['variants'] ) ? $item['variants'] : [];
+	// Solo variantes vivas: las borradas (deleted_at) no deben contar para
+	// decidir variable/simple, ni crear atributos/variaciones, ni adoptarse
+	// por variant_id/SKU. Si no queda ninguna viva, no se crea nada.
+	$variants = lvs_live_variants( isset( $item['variants'] ) ? $item['variants'] : [] );
 	if ( ! $variants ) return;
+	$item['variants'] = $variants;
 
 	$is_var  = count( $variants ) > 1;
 	$type    = $is_var ? 'variable' : 'simple';
@@ -648,6 +675,7 @@ function lvs_sync_variants_global( $force = false ) {
 			return false;
 		}
 		foreach ( $data['variants'] as $v ) {
+			if ( ! empty( $v['deleted_at'] ) ) continue; // borrada en Loyverse: no es "vista" viva
 			$vid = '';
 			if ( ! empty( $v['variant_id'] ) ) $vid = (string) $v['variant_id'];
 			elseif ( ! empty( $v['id'] ) ) $vid = (string) $v['id'];
@@ -728,11 +756,14 @@ function lvs_refresh_single_variant_parent( $parent_id ) {
 			if ( isset( $data['variants'] ) ) $item = $data;
 			elseif ( isset( $data['item']['variants'] ) ) $item = $data['item'];
 		}
-		if ( $item && isset( $item['variants'] ) && count( $item['variants'] ) === 1 ) {
+		$live = $item && isset( $item['variants'] ) ? lvs_live_variants( $item['variants'] ) : [];
+		if ( count( $live ) === 1 ) {
+			$item['variants'] = $live;
 			lvs_upsert_item( $item, lvs_categories() );
 			return;
 		}
-		if ( $item && isset( $item['variants'] ) && count( $item['variants'] ) > 1 ) {
+		if ( count( $live ) > 1 ) {
+			$item['variants'] = $live;
 			lvs_upsert_item( $item, lvs_categories() ); // volvió a ser variable
 			return;
 		}
@@ -1162,7 +1193,7 @@ function lvs_admin_page() {
 				<p>Sincroniza Loyverse con WooCommerce: productos, variantes, im&aacute;genes, inventario, eliminaciones y &oacute;rdenes &rarr; recibos.</p>
 			</div>
 			<div class="lvs-hero-side">
-				<span class="lvs-badge">Versi&oacute;n 1.1.1</span>
+				<span class="lvs-badge">Versi&oacute;n 1.1.2</span>
 				<?php if ( lvs_token() ) : ?><span class="lvs-pill lvs-pill-ok">Token configurado</span><?php else : ?><span class="lvs-pill lvs-pill-bad">Falta el token</span><?php endif; ?>
 			</div>
 		</header>
@@ -1187,7 +1218,7 @@ function lvs_admin_page() {
 					<div class="lvs-row"><dt>Imágenes pendientes de descargar/verificar</dt><dd><?php echo (int) $noimg; ?></dd></div>
 					<div class="lvs-row"><dt>Productos sin imagen en Loyverse</dt><dd><?php echo (int) $noimg_lv; ?></dd></div>
 					<div class="lvs-row"><dt>Órdenes pendientes de enviar</dt><dd><?php echo (int) $pending; ?></dd></div>
-					<div class="lvs-row"><dt>Versión del plugin</dt><dd>1.1.1</dd></div>
+					<div class="lvs-row"><dt>Versión del plugin</dt><dd>1.1.2</dd></div>
 					<div class="lvs-row"><dt>Reconciliación de productos pendiente</dt><dd><?php echo get_option( 'lvs_reconcile_pending', null ) ? '<b style="color:#b32d2e">SÍ (se reintenta en la próxima sincronización)</b>' : 'No'; ?></dd></div>
 					<div class="lvs-row"><dt>Última reconciliación de variaciones (/variants)</dt><dd><?php $vl = (int) get_option( 'lvs_var_last', 0 ); echo $vl ? esc_html( date_i18n( 'Y-m-d H:i:s', $vl ) ) : '—'; ?></dd></div>
 					<div class="lvs-row"><dt>Barrido de variaciones en curso</dt><dd><?php $vs2 = get_option( 'lvs_var_state', [] ); echo ! empty( $vs2['active'] ) ? 'Sí (se reanuda automáticamente)' : 'No'; ?></dd></div>

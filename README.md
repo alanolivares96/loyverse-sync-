@@ -30,6 +30,9 @@ WooCommerce → Loyverse Sync: estado de la sincronización, productos vinculado
 
 ## Changelog
 
+### 1.1.2
+- Las variantes borradas en Loyverse (con `deleted_at`) ya no resucitan en WooCommerce: se ignoran en `/items`, en el barrido global de `/variants` y al buscar el producto por `variant_id`/SKU, así que la reconciliación global las elimina de Woo. Corrige el caso en que un producto con 2 variantes vivas mostraba tallas viejas borradas tras forzar un sync.
+
 ### 1.1.1
 - Solo rediseño estético del panel admin: cabecera moderna, tarjetas de estado, botones y barra de progreso renovados. Sin cambios en sincronización, AJAX, opciones ni nonces.
 
