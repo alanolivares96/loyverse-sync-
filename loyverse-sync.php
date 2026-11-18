@@ -2,8 +2,29 @@
 /**
  * Plugin Name: Loyverse Sync
  * Description: Sincroniza Loyverse con WooCommerce: productos, variantes, imágenes, inventario, eliminaciones y órdenes → recibos.
- * Version: 1.1.2
+ * Version: 1.1.3
  * Requires Plugins: woocommerce
+ *
+ * Novedades 1.1.3:
+ *  - No pisar ediciones en Woo: opcion "No sobrescribir nombre y
+ *    descripcion editados en WooCommerce" (lvs_preserve_edits, apagada
+ *    por defecto); con ella activa, un producto existente conserva su
+ *    nombre y descripcion, y solo se actualizan precio, stock, imagen,
+ *    categoria y variaciones. Los productos nuevos si toman los datos
+ *    de Loyverse.
+ *  - Modo simulacion (lvs_dry_run, apagado por defecto): la
+ *    reconciliacion de productos y de variaciones, lvs_delete_item(),
+ *    lvs_sync_variations() y lvs_delete_all_variations() no borran ni
+ *    mandan nada a papelera; solo registran "[Simulacion] ..." en el
+ *    log y la reconciliacion se da por completada sin quedar pendiente.
+ *  - Avisos de error: el ultimo error relevante queda en
+ *    lvs_last_error (mensaje + fecha), se muestra en el panel y como
+ *    admin_notice en wp-admin si es de las ultimas 24h; se limpia al
+ *    terminar una sincronizacion completa sin errores.
+ *  - Sincronizar un solo producto: meta box "Loyverse Sync" en la
+ *    edicion del producto, con el ID de Loyverse vinculado y un boton
+ *    para traer el item fresco (GET /items/{id}) y sincronizar solo
+ *    ese producto.
  *
  * Novedades 1.1.2:
  *  - Variantes borradas en Loyverse ya no resucitan en Woo: se ignoran
@@ -86,6 +107,39 @@ function lvs_live_variants( $variants ) {
 	return $out;
 }
 
+// Opciones nuevas 1.1.3 (por defecto desactivadas: no cambian el
+// comportamiento actual salvo que se activen en el panel).
+function lvs_dry_run() {
+	return (bool) get_option( 'lvs_dry_run', 0 );
+}
+
+function lvs_preserve_edits() {
+	return (bool) get_option( 'lvs_preserve_edits', 0 );
+}
+
+// Ultimo error relevante: se guarda con mensaje y timestamp para
+// mostrarlo en el panel y como admin_notice. Un flag global marca si
+// la corrida actual registro algun error, para no limpiarlo al final
+// de una sincronizacion que si tuvo errores.
+function lvs_set_last_error( $msg ) {
+	global $lvs_had_error;
+	$lvs_had_error = true;
+	$msg = trim( (string) $msg );
+	if ( $msg === '' ) return;
+	update_option( 'lvs_last_error', [ 'msg' => $msg, 'ts' => time() ], false );
+	lvs_log( 'Error: ' . $msg, 'error' );
+}
+
+function lvs_get_last_error() {
+	$e = get_option( 'lvs_last_error', null );
+	if ( ! is_array( $e ) || empty( $e['msg'] ) ) return null;
+	return [ 'msg' => (string) $e['msg'], 'ts' => (int) ( isset( $e['ts'] ) ? $e['ts'] : 0 ) ];
+}
+
+function lvs_clear_last_error() {
+	delete_option( 'lvs_last_error' );
+}
+
 function lvs_request( $method, $path, $args = [], $body = null ) {
 	$url = LVS_API . $path;
 	if ( $args ) $url = add_query_arg( $args, $url );
@@ -119,7 +173,10 @@ function lvs_request( $method, $path, $args = [], $body = null ) {
 
 function lvs_get( $path, $args = [] ) {
 	$r = lvs_request( 'GET', $path, $args );
-	return $r['ok'] ? $r['data'] : null;
+	if ( $r['ok'] ) return $r['data'];
+	$detail = isset( $r['code'] ) ? 'HTTP ' . (int) $r['code'] : 'sin respuesta';
+	lvs_set_last_error( 'Error de la API de Loyverse GET ' . $path . ' (' . $detail . '). Revisa el token en WooCommerce → Loyverse Sync.' );
+	return null;
 }
 
 function lvs_store_id() {
@@ -218,6 +275,7 @@ function lvs_run_sync( $force_full = false, $budget = 220 ) {
 	@set_time_limit( $budget + 60 );
 	@ini_set( 'memory_limit', '512M' );
 	$t0 = time();
+	$GLOBALS['lvs_had_error'] = false;
 	lvs_progress( 'items', 0, null, true );
 
 	try {
@@ -238,8 +296,11 @@ function lvs_run_sync( $force_full = false, $budget = 220 ) {
 		lvs_sync_inventory();
 		lvs_retry_orders();
 	} catch ( Throwable $e ) {
-		lvs_log( 'Error en sync: ' . $e->getMessage(), 'error' );
+		lvs_set_last_error( 'Error en sincronización: ' . $e->getMessage() );
 	}
+	// Sincronización completa sin errores en esta corrida: limpia el
+	// último error guardado. Si esta corrida registró alguno, se conserva.
+	if ( empty( $GLOBALS['lvs_had_error'] ) ) lvs_clear_last_error();
 	delete_transient( 'lvs_lock' );
 	lvs_progress( 'done', null, null, false );
 	return true;
@@ -380,6 +441,10 @@ function lvs_find_product( $item ) {
 function lvs_delete_item( $loyverse_id ) {
 	$id = lvs_find_by_meta( '_loyverse_id', $loyverse_id );
 	if ( $id && get_post_status( $id ) !== 'trash' ) {
+		if ( lvs_dry_run() ) {
+			lvs_log( "[Simulación] Eliminado en Loyverse → se mandaría a papelera en Woo: #$id (no se borró nada)" );
+			return;
+		}
 		wp_trash_post( $id ); // a la papelera (recuperable)
 		lvs_log( "Eliminado en Loyverse → papelera en Woo: #$id" );
 	}
@@ -405,6 +470,7 @@ function lvs_reconcile( $seen ) {
 	global $wpdb;
 	if ( ! $seen ) {
 		lvs_log( 'Reconciliación abortada: lista de productos vistos vacía.', 'warning' );
+		lvs_set_last_error( 'Reconciliación abortada: lista de productos vistos vacía.' );
 		return false;
 	}
 	$seen = array_flip( $seen );
@@ -417,8 +483,18 @@ function lvs_reconcile( $seen ) {
 	foreach ( $rows as $r ) if ( ! isset( $seen[ $r->meta_value ] ) ) $orphans[] = (int) $r->post_id;
 	// Protección: no borrar en masa si algo luce raro
 	if ( count( $orphans ) > 5 && count( $orphans ) > count( $rows ) * 0.5 ) {
-		lvs_log( 'Reconciliación abortada: ' . count( $orphans ) . ' de ' . count( $rows ) . ' serían eliminados. Queda pendiente para revisión/reintento.', 'warning' );
+		$abort = 'Reconciliación abortada: ' . count( $orphans ) . ' de ' . count( $rows ) . ' serían eliminados. Queda pendiente para revisión/reintento.';
+		lvs_log( $abort, 'warning' );
+		lvs_set_last_error( $abort );
 		return false;
+	}
+	if ( lvs_dry_run() ) {
+		foreach ( $orphans as $pid ) {
+			$child_ids = lvs_variation_post_ids( $pid );
+			lvs_log( "[Simulación] Reconciliación: #$pid ya no existe en Loyverse → se mandaría a papelera (no se borró nada)" );
+			if ( $child_ids ) lvs_log( '[Simulación] Sus ' . count( $child_ids ) . ' variaciones hijas tampoco se eliminarían.' );
+		}
+		return true; // simulación completada: no queda pendiente
 	}
 	foreach ( $orphans as $pid ) {
 		// Borra también sus variaciones hijas: un producto en papelera con
@@ -444,7 +520,12 @@ function lvs_variation_post_ids( $parent_id ) {
 }
 
 function lvs_delete_all_variations( $parent_id ) {
-	foreach ( lvs_variation_post_ids( $parent_id ) as $cid ) wp_delete_post( $cid, true );
+	$all = lvs_variation_post_ids( $parent_id );
+	if ( lvs_dry_run() ) {
+		if ( $all ) lvs_log( '[Simulación] Se eliminarían ' . count( $all ) . ' variaciones hijas de #' . (int) $parent_id . ' (no se borró nada)' );
+		return;
+	}
+	foreach ( $all as $cid ) wp_delete_post( $cid, true );
 	$p = wc_get_product( $parent_id );
 	if ( $p && $p->is_type( 'variable' ) ) {
 		foreach ( $p->get_children() as $cid ) wp_delete_post( $cid, true );
@@ -567,8 +648,14 @@ function lvs_upsert_item( $item, $cats ) {
 	}
 	if ( ! $product ) $product = $is_var ? new WC_Product_Variable() : new WC_Product_Simple();
 
-	$product->set_name( $item['item_name'] );
-	$product->set_description( isset( $item['description'] ) ? (string) $item['description'] : '' );
+	// Con "No sobrescribir nombre y descripción" activo, un producto
+	// que ya existe conserva su nombre y descripción editados en Woo;
+	// precio, stock, imagen, categoría y variaciones se actualizan
+	// igual. Los productos nuevos sí toman los datos de Loyverse.
+	if ( $is_new || ! lvs_preserve_edits() ) {
+		$product->set_name( $item['item_name'] );
+		$product->set_description( isset( $item['description'] ) ? (string) $item['description'] : '' );
+	}
 	$product->set_status( 'publish' );
 
 	if ( ! empty( $item['category_id'] ) && isset( $cats[ $item['category_id'] ] ) ) {
@@ -635,14 +722,23 @@ function lvs_sync_variations( $parent_id, $item, $variants ) {
 	}
 
 	// Variantes eliminadas en Loyverse: las que get_children() devolvió…
-	$keep = array_map( 'intval', $keep );
-	foreach ( $all_old as $cid ) {
-		if ( ! in_array( (int) $cid, $keep, true ) ) wp_delete_post( $cid, true );
-	}
 	// …y cualquier post de variación hijo que get_children() no devolvió
 	// (papelera u otros estados): si no está en $keep, ya no existe en Loyverse.
+	$keep = array_map( 'intval', $keep );
+	$to_delete = [];
+	foreach ( $all_old as $cid ) {
+		if ( ! in_array( (int) $cid, $keep, true ) ) $to_delete[] = (int) $cid;
+	}
 	foreach ( lvs_variation_post_ids( $parent_id ) as $cid ) {
-		if ( ! in_array( (int) $cid, $keep, true ) ) wp_delete_post( $cid, true );
+		if ( ! in_array( (int) $cid, $keep, true ) ) $to_delete[] = (int) $cid;
+	}
+	$to_delete = array_values( array_unique( $to_delete ) );
+	if ( lvs_dry_run() ) {
+		foreach ( $to_delete as $cid ) {
+			lvs_log( "[Simulación] Variación #$cid de #$parent_id ya no existe en Loyverse → se eliminaría (no se borró nada)" );
+		}
+	} else {
+		foreach ( $to_delete as $cid ) wp_delete_post( $cid, true );
 	}
 	WC_Product_Variable::sync( $parent_id );
 }
@@ -699,6 +795,7 @@ function lvs_reconcile_variations_global( $seen_variant_ids ) {
 	global $wpdb;
 	if ( ! $seen_variant_ids ) {
 		lvs_log( 'Reconciliación de variaciones abortada: lista de Loyverse vacía.', 'warning' );
+		lvs_set_last_error( 'Reconciliación de variaciones abortada: lista de Loyverse vacía.' );
 		return false;
 	}
 	$seen = array_flip( $seen_variant_ids );
@@ -719,8 +816,17 @@ function lvs_reconcile_variations_global( $seen_variant_ids ) {
 		$parents[ (int) get_post_field( 'post_parent', $pid ) ] = true;
 	}
 	if ( count( $orphans ) > 5 && count( $orphans ) > count( $rows ) * 0.5 ) {
-		lvs_log( 'Reconciliación de variaciones abortada: ' . count( $orphans ) . ' de ' . count( $rows ) . ' serían eliminadas.', 'warning' );
+		$abort = 'Reconciliación de variaciones abortada: ' . count( $orphans ) . ' de ' . count( $rows ) . ' serían eliminadas.';
+		lvs_log( $abort, 'warning' );
+		lvs_set_last_error( $abort );
 		return false;
+	}
+	if ( lvs_dry_run() ) {
+		foreach ( $orphans as $cid ) {
+			lvs_log( "[Simulación] Reconciliación de variaciones: variación #$cid ya no existe en Loyverse → se eliminaría (no se borró nada)" );
+		}
+		if ( $orphans ) lvs_log( '[Simulación] Reconciliación de variaciones: ' . count( $orphans ) . ' se eliminarían, ' . count( $parents ) . ' productos padre revisados (sin cambios).' );
+		return true; // simulación completada: no queda pendiente
 	}
 	foreach ( $orphans as $cid ) {
 		lvs_log( "Reconciliación de variaciones: variación #$cid ya no existe en Loyverse → eliminada" );
@@ -1139,6 +1245,95 @@ add_action( 'admin_post_lvs_save_token', function () {
 	exit;
 } );
 
+// Ajustes 1.1.3: no sobrescribir nombre/descripción y modo simulación.
+add_action( 'admin_post_lvs_save_settings', function () {
+	if ( ! current_user_can( 'manage_woocommerce' ) ) wp_die( 'No autorizado' );
+	check_admin_referer( 'lvs_save_settings' );
+	update_option( 'lvs_preserve_edits', isset( $_POST['lvs_preserve_edits'] ) ? 1 : 0, false );
+	update_option( 'lvs_dry_run', isset( $_POST['lvs_dry_run'] ) ? 1 : 0, false );
+	wp_safe_redirect( admin_url( 'admin.php?page=loyverse-sync&settings=1' ) );
+	exit;
+} );
+
+// Sincronizar un solo producto (meta box en la edición del producto).
+add_action( 'add_meta_boxes', function () {
+	add_meta_box( 'lvs-sync', 'Loyverse Sync', 'lvs_product_meta_box', 'product', 'side', 'default' );
+} );
+
+function lvs_product_meta_box( $post ) {
+	$loy_id = get_post_meta( $post->ID, '_loyverse_id', true );
+	if ( ! $loy_id ) {
+		echo '<p>Este producto no está vinculado a Loyverse (sin ID de Loyverse).</p>';
+		return;
+	}
+	echo '<p>ID de Loyverse: <code>' . esc_html( $loy_id ) . '</code></p>';
+	echo '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '">';
+	echo '<input type="hidden" name="action" value="lvs_sync_one">';
+	echo '<input type="hidden" name="product_id" value="' . (int) $post->ID . '">';
+	wp_nonce_field( 'lvs_sync_one' );
+	echo '<button type="submit" class="button button-primary">Sincronizar este producto ahora</button>';
+	echo '</form>';
+	echo '<p class="description">Trae el producto fresco de Loyverse y actualiza solo este producto.</p>';
+}
+
+add_action( 'admin_post_lvs_sync_one', function () {
+	if ( ! current_user_can( 'manage_woocommerce' ) ) wp_die( 'No autorizado' );
+	check_admin_referer( 'lvs_sync_one' );
+	$pid = isset( $_POST['product_id'] ) ? (int) $_POST['product_id'] : 0;
+	$edit = admin_url( 'post.php?post=' . $pid . '&action=edit' );
+	$loy_id = $pid ? get_post_meta( $pid, '_loyverse_id', true ) : '';
+	if ( ! $pid || ! $loy_id ) {
+		wp_safe_redirect( $edit . '&lvs_sync_error=1' );
+		exit;
+	}
+	$data = lvs_get( '/items/' . $loy_id );
+	$item = null;
+	if ( is_array( $data ) ) {
+		if ( isset( $data['variants'] ) ) $item = $data;
+		elseif ( isset( $data['item']['variants'] ) ) $item = $data['item'];
+	}
+	if ( ! $item ) {
+		lvs_set_last_error( 'Sincronización individual: no se pudo traer el producto ' . $loy_id . ' de Loyverse.' );
+		wp_safe_redirect( $edit . '&lvs_sync_error=1' );
+		exit;
+	}
+	try {
+		if ( ! empty( $item['deleted_at'] ) ) {
+			lvs_delete_item( $item['id'] );
+		} else {
+			lvs_upsert_item( $item, lvs_categories() );
+		}
+	} catch ( Throwable $e ) {
+		lvs_set_last_error( 'Sincronización individual del producto #' . $pid . ': ' . $e->getMessage() );
+		wp_safe_redirect( $edit . '&lvs_sync_error=1' );
+		exit;
+	}
+	wp_safe_redirect( $edit . '&lvs_sync_ok=1' );
+	exit;
+} );
+
+// Aviso en la edición del producto tras sincronizar uno solo.
+add_action( 'admin_notices', function () {
+	if ( ! current_user_can( 'manage_woocommerce' ) ) return;
+	if ( ! isset( $_GET['lvs_sync_ok'] ) && ! isset( $_GET['lvs_sync_error'] ) ) return;
+	if ( isset( $_GET['lvs_sync_ok'] ) ) {
+		echo '<div class="notice notice-success is-dismissible"><p>Loyverse Sync: producto sincronizado correctamente.</p></div>';
+	} else {
+		echo '<div class="notice notice-error is-dismissible"><p>Loyverse Sync: no se pudo sincronizar el producto. Revisa WooCommerce → Loyverse Sync y el registro loyverse-sync.</p></div>';
+	}
+} );
+
+// Aviso global en wp-admin cuando hay un error de las últimas 24h.
+add_action( 'admin_notices', function () {
+	if ( ! current_user_can( 'manage_woocommerce' ) ) return;
+	// En el propio panel ya se muestra la tarjeta de error; no duplicar.
+	if ( isset( $_GET['page'] ) && $_GET['page'] === 'loyverse-sync' ) return;
+	$err = lvs_get_last_error();
+	if ( ! $err || ! $err['ts'] || ( time() - $err['ts'] ) > 86400 ) return;
+	$url = esc_url( admin_url( 'admin.php?page=loyverse-sync' ) );
+	echo '<div class="notice notice-error is-dismissible"><p><strong>Loyverse Sync:</strong> ' . esc_html( $err['msg'] ) . ' <a href="' . $url . '">Ver panel de Loyverse Sync</a></p></div>';
+} );
+
 function lvs_admin_page() {
 	global $wpdb;
 	$st      = wp_parse_args( get_option( 'lvs_state', [] ), [ 'full_done' => false, 'last_sync' => '' ] );
@@ -1186,6 +1381,11 @@ function lvs_admin_page() {
 #lvs-bar.lvs-ind{background:repeating-linear-gradient(45deg,#2271b1,#2271b1 10px,#72aee6 10px,#72aee6 20px)!important;background-size:28px 28px;animation:lvsmove .8s linear infinite}
 @keyframes lvsmove{from{background-position:0 0}to{background-position:28px 0}}
 .lvs-wrap .notice{border-radius:8px;margin:14px 0 0}
+.lvs-error{background:#fbeaea;border:1px solid #d63638;border-left:4px solid #d63638;border-radius:12px;padding:14px 18px;margin:16px 0;color:#3c434a}
+.lvs-error strong{color:#b32d2e}
+.lvs-dry{background:#fef8e7;border:1px solid #dba617;border-left:4px solid #dba617;border-radius:12px;padding:14px 18px;margin:16px 0;color:#3c434a}
+.lvs-checks label{display:block;margin:0 0 10px;font-weight:600;color:#0f172a}
+.lvs-checks .description{font-weight:400;color:#646970;display:block;margin-top:2px}
 </style>
 		<header class="lvs-hero">
 			<div>
@@ -1193,12 +1393,15 @@ function lvs_admin_page() {
 				<p>Sincroniza Loyverse con WooCommerce: productos, variantes, im&aacute;genes, inventario, eliminaciones y &oacute;rdenes &rarr; recibos.</p>
 			</div>
 			<div class="lvs-hero-side">
-				<span class="lvs-badge">Versi&oacute;n 1.1.2</span>
+				<span class="lvs-badge">Versi&oacute;n 1.1.3</span>
 				<?php if ( lvs_token() ) : ?><span class="lvs-pill lvs-pill-ok">Token configurado</span><?php else : ?><span class="lvs-pill lvs-pill-bad">Falta el token</span><?php endif; ?>
 			</div>
 		</header>
 		<?php if ( isset( $_GET['done'] ) ) echo '<div class="notice notice-success"><p>Listo. Revisa WooCommerce → Estado → Registros → loyverse-sync.</p></div>'; ?>
 		<?php if ( isset( $_GET['saved'] ) ) echo '<div class="notice notice-success"><p>Token guardado.</p></div>'; ?>
+		<?php if ( isset( $_GET['settings'] ) ) echo '<div class="notice notice-success"><p>Ajustes guardados.</p></div>'; ?>
+		<?php if ( lvs_dry_run() ) : ?><div class="lvs-dry"><strong>Modo simulación activo:</strong> la reconciliación y las eliminaciones no borrarán ni mandarán nada a la papelera; solo se registrará en el log lo que se borraría. Desactívalo en Ajustes de sincronización cuando quieras aplicar los cambios de verdad.</div><?php endif; ?>
+		<?php $lvs_err = lvs_get_last_error(); if ( $lvs_err ) : ?><div class="lvs-error"><strong>Último error de Loyverse Sync</strong> (<?php echo esc_html( date_i18n( 'Y-m-d H:i:s', $lvs_err['ts'] ) ); ?>):<br><?php echo esc_html( $lvs_err['msg'] ); ?><br><span style="color:#646970">Revisa WooCommerce → Estado → Registros → loyverse-sync para el detalle. El aviso se limpia solo cuando una sincronización completa termine sin errores.</span></div><?php endif; ?>
 		<section class="lvs-cards">
 			<div class="lvs-card"><div class="lvs-ico">&#128230;</div><div class="lvs-num"><?php echo (int) $total; ?></div><div class="lvs-lbl">Productos vinculados</div></div>
 			<div class="lvs-card"><div class="lvs-ico">&#129534;</div><div class="lvs-num"><?php echo (int) $pending; ?></div><div class="lvs-lbl">&Oacute;rdenes pendientes de enviar</div></div>
@@ -1218,7 +1421,9 @@ function lvs_admin_page() {
 					<div class="lvs-row"><dt>Imágenes pendientes de descargar/verificar</dt><dd><?php echo (int) $noimg; ?></dd></div>
 					<div class="lvs-row"><dt>Productos sin imagen en Loyverse</dt><dd><?php echo (int) $noimg_lv; ?></dd></div>
 					<div class="lvs-row"><dt>Órdenes pendientes de enviar</dt><dd><?php echo (int) $pending; ?></dd></div>
-					<div class="lvs-row"><dt>Versión del plugin</dt><dd>1.1.2</dd></div>
+					<div class="lvs-row"><dt>Modo simulación</dt><dd><?php echo lvs_dry_run() ? '<b style="color:#b32d2e">Activo (no se borra nada)</b>' : 'No'; ?></dd></div>
+					<div class="lvs-row"><dt>No sobrescribir nombre/descripción</dt><dd><?php echo lvs_preserve_edits() ? 'Sí (productos existentes conservan sus ediciones)' : 'No'; ?></dd></div>
+					<div class="lvs-row"><dt>Versión del plugin</dt><dd>1.1.3</dd></div>
 					<div class="lvs-row"><dt>Reconciliación de productos pendiente</dt><dd><?php echo get_option( 'lvs_reconcile_pending', null ) ? '<b style="color:#b32d2e">SÍ (se reintenta en la próxima sincronización)</b>' : 'No'; ?></dd></div>
 					<div class="lvs-row"><dt>Última reconciliación de variaciones (/variants)</dt><dd><?php $vl = (int) get_option( 'lvs_var_last', 0 ); echo $vl ? esc_html( date_i18n( 'Y-m-d H:i:s', $vl ) ) : '—'; ?></dd></div>
 					<div class="lvs-row"><dt>Barrido de variaciones en curso</dt><dd><?php $vs2 = get_option( 'lvs_var_state', [] ); echo ! empty( $vs2['active'] ) ? 'Sí (se reanuda automáticamente)' : 'No'; ?></dd></div>
@@ -1237,6 +1442,19 @@ function lvs_admin_page() {
 						<button type="button" class="button lvs-run" data-mode="images">Reintentar imágenes faltantes</button>
 						<button type="button" class="button lvs-run" data-mode="full">Resincronización completa</button>
 					</div>
+				</section>
+				<section class="lvs-panel">
+					<h2>Ajustes de sincronización</h2>
+					<p class="lvs-sub">Opciones de la versión 1.1.3. Ambas están desactivadas por defecto.</p>
+					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="lvs-checks">
+						<input type="hidden" name="action" value="lvs_save_settings">
+						<?php wp_nonce_field( 'lvs_save_settings' ); ?>
+						<label><input type="checkbox" name="lvs_preserve_edits" value="1" <?php checked( lvs_preserve_edits() ); ?>> No sobrescribir nombre y descripción editados en WooCommerce
+							<span class="description">Con esta opción activa, un producto que ya existe conserva su nombre y descripción editados en Woo; solo se actualizan precio, stock, imagen, categoría y variaciones. Los productos nuevos sí toman los datos de Loyverse.</span></label>
+						<label><input type="checkbox" name="lvs_dry_run" value="1" <?php checked( lvs_dry_run() ); ?>> Modo simulación (no borrar nada)
+							<span class="description">La reconciliación de productos y de variaciones no borrará ni mandará nada a la papelera; solo registrará en el log lo que se borraría, como “[Simulación] …”. Úsalo para revisar antes de aplicar una limpieza.</span></label>
+						<button class="button button-primary">Guardar ajustes</button>
+					</form>
 				</section>
 				<section class="lvs-panel">
 					<h2>Token de Loyverse</h2>
